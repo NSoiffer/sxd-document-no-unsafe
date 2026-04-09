@@ -29,7 +29,6 @@ use self::Reference::*;
 
 use super::{PrefixedName, QName, dom, str::XmlStr};
 
-#[cfg(feature = "no-unsafe")]
 use crate::string_pool::InternedString;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -921,28 +920,12 @@ impl<'d> DomBuilder<'d> {
         }
     }
 
-    #[cfg(not(feature = "no-unsafe"))]
-    fn default_namespace_uri(&self) -> Option<&str> {
-        self.elements
-            .last()
-            .and_then(|e| e.recursive_default_namespace_uri())
-    }
-
-    #[cfg(feature = "no-unsafe")]
     fn default_namespace_uri(&self) -> Option<InternedString> {
         self.elements
             .last()
             .and_then(|e| e.recursive_default_namespace_uri())
     }
 
-    #[cfg(not(feature = "no-unsafe"))]
-    fn namespace_uri_for_prefix(&self, prefix: &str) -> Option<&str> {
-        self.elements
-            .last()
-            .and_then(|e| e.namespace_uri_for_prefix(prefix))
-    }
-
-    #[cfg(feature = "no-unsafe")]
     fn namespace_uri_for_prefix(&self, prefix: &str) -> Option<InternedString> {
         self.elements
             .last()

@@ -1,8 +1,48 @@
 use super::{QName, lazy_hash_map::LazyHashMap};
 
 use crate::string_pool::{InternedString, StringPool};
-use std::{marker::PhantomData, slice};
-use typed_arena::Arena;
+use std::{cell::RefCell, marker::PhantomData};
+
+// --- Typed index handle ---
+
+pub struct Index<T> {
+    idx: usize,
+    _marker: PhantomData<T>,
+}
+
+impl<T> Copy for Index<T> {}
+impl<T> Clone for Index<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> PartialEq for Index<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.idx == other.idx
+    }
+}
+impl<T> Eq for Index<T> {}
+impl<T> std::hash::Hash for Index<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.idx.hash(state)
+    }
+}
+impl<T> std::fmt::Debug for Index<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Index({})", self.idx)
+    }
+}
+
+impl<T> Index<T> {
+    fn new(idx: usize) -> Self {
+        Index {
+            idx,
+            _marker: PhantomData,
+        }
+    }
+}
+
+// --- Interned QName ---
 
 struct InternedQName {
     namespace_uri: Option<InternedString>,
@@ -12,11 +52,48 @@ struct InternedQName {
 impl InternedQName {
     fn as_qname(&self) -> QName<'_> {
         QName {
-            namespace_uri: self.namespace_uri.map(|n| n.as_slice()),
+            namespace_uri: self.namespace_uri.as_deref(),
             local_part: &self.local_part,
         }
     }
 }
+
+impl Clone for InternedQName {
+    fn clone(&self) -> Self {
+        InternedQName {
+            namespace_uri: self.namespace_uri.clone(),
+            local_part: self.local_part.clone(),
+        }
+    }
+}
+
+// --- Public owned QName wrapper ---
+
+pub struct QNameValue {
+    namespace_uri: Option<InternedString>,
+    local_part: InternedString,
+}
+
+impl QNameValue {
+    pub fn get(&self) -> QName<'_> {
+        QName {
+            namespace_uri: self.namespace_uri.as_deref(),
+            local_part: &self.local_part,
+        }
+    }
+
+    pub fn local_part_clone(&self) -> InternedString {
+        self.local_part.clone()
+    }
+}
+
+impl std::fmt::Debug for QNameValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+// --- Node types ---
 
 pub struct Root {
     children: Vec<ChildOfRoot>,
@@ -28,61 +105,25 @@ pub struct Element {
     preferred_prefix: Option<InternedString>,
     children: Vec<ChildOfElement>,
     parent: Option<ParentOfChild>,
-    attributes: Vec<*mut Attribute>,
+    attributes: Vec<Index<Attribute>>,
     prefix_to_namespace: LazyHashMap<InternedString, InternedString>,
-}
-
-impl Element {
-    pub fn name(&self) -> QName<'_> {
-        self.name.as_qname()
-    }
-    pub fn default_namespace_uri(&self) -> Option<&str> {
-        self.default_namespace_uri.map(|p| p.as_slice())
-    }
-    pub fn preferred_prefix(&self) -> Option<&str> {
-        self.preferred_prefix.map(|p| p.as_slice())
-    }
 }
 
 pub struct Attribute {
     name: InternedQName,
     preferred_prefix: Option<InternedString>,
     value: InternedString,
-    parent: Option<*mut Element>,
-}
-
-impl Attribute {
-    pub fn name(&self) -> QName<'_> {
-        self.name.as_qname()
-    }
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-    pub fn preferred_prefix(&self) -> Option<&str> {
-        self.preferred_prefix.map(|p| p.as_slice())
-    }
+    parent: Option<Index<Element>>,
 }
 
 pub struct Text {
     text: InternedString,
-    parent: Option<*mut Element>,
-}
-
-impl Text {
-    pub fn text(&self) -> &str {
-        &self.text
-    }
+    parent: Option<Index<Element>>,
 }
 
 pub struct Comment {
     text: InternedString,
     parent: Option<ParentOfChild>,
-}
-
-impl Comment {
-    pub fn text(&self) -> &str {
-        &self.text
-    }
 }
 
 pub struct ProcessingInstruction {
@@ -91,168 +132,43 @@ pub struct ProcessingInstruction {
     parent: Option<ParentOfChild>,
 }
 
-impl ProcessingInstruction {
-    pub fn target(&self) -> &str {
-        &self.target
-    }
-    pub fn value(&self) -> Option<&str> {
-        self.value.map(|v| v.as_slice())
-    }
-}
+// --- Child/Parent enums ---
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ChildOfRoot {
-    Element(*mut Element),
-    Comment(*mut Comment),
-    ProcessingInstruction(*mut ProcessingInstruction),
+    Element(Index<Element>),
+    Comment(Index<Comment>),
+    ProcessingInstruction(Index<ProcessingInstruction>),
 }
 
 impl ChildOfRoot {
     fn is_element(&self) -> bool {
         matches!(self, ChildOfRoot::Element(_))
     }
-
-    fn replace_parent(&self, parent: *mut Root) {
-        match *self {
-            ChildOfRoot::Element(n) => {
-                let parent_r = unsafe { &mut *parent };
-                let n = unsafe { &mut *n };
-                parent_r.children.retain(|c| !c.is_element());
-                replace_parent(*self, ParentOfChild::Root(parent), &mut n.parent);
-            }
-            ChildOfRoot::Comment(n) => {
-                let n = unsafe { &mut *n };
-                replace_parent(*self, ParentOfChild::Root(parent), &mut n.parent);
-            }
-            ChildOfRoot::ProcessingInstruction(n) => {
-                let n = unsafe { &mut *n };
-                replace_parent(*self, ParentOfChild::Root(parent), &mut n.parent);
-            }
-        };
-    }
-
-    fn remove_parent(&self) {
-        match *self {
-            ChildOfRoot::Element(n) => {
-                let n = unsafe { &mut *n };
-                n.parent = None;
-            }
-            ChildOfRoot::Comment(n) => {
-                let n = unsafe { &mut *n };
-                n.parent = None;
-            }
-            ChildOfRoot::ProcessingInstruction(n) => {
-                let n = unsafe { &mut *n };
-                n.parent = None;
-            }
-        };
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ChildOfElement {
-    Element(*mut Element),
-    Text(*mut Text),
-    Comment(*mut Comment),
-    ProcessingInstruction(*mut ProcessingInstruction),
-}
-
-fn replace_parent(
-    child: ChildOfRoot,
-    parent: ParentOfChild,
-    parent_field: &mut Option<ParentOfChild>,
-) {
-    if let Some(prev_parent) = *parent_field {
-        match prev_parent {
-            ParentOfChild::Root(r) => {
-                let r_r = unsafe { &mut *r };
-                r_r.children.retain(|n| *n != child);
-            }
-            ParentOfChild::Element(e) => {
-                let e_r = unsafe { &mut *e };
-                let as_element_child = child.into();
-                e_r.children.retain(|n| *n != as_element_child);
-            }
-        }
-    }
-
-    *parent_field = Some(parent);
-}
-
-impl ChildOfElement {
-    fn replace_parent(&self, parent: *mut Element) {
-        match *self {
-            ChildOfElement::Element(n) => {
-                let n = unsafe { &mut *n };
-                replace_parent(
-                    ChildOfRoot::Element(n),
-                    ParentOfChild::Element(parent),
-                    &mut n.parent,
-                );
-            }
-            ChildOfElement::Comment(n) => {
-                let n = unsafe { &mut *n };
-                replace_parent(
-                    ChildOfRoot::Comment(n),
-                    ParentOfChild::Element(parent),
-                    &mut n.parent,
-                );
-            }
-            ChildOfElement::ProcessingInstruction(n) => {
-                let n = unsafe { &mut *n };
-                replace_parent(
-                    ChildOfRoot::ProcessingInstruction(n),
-                    ParentOfChild::Element(parent),
-                    &mut n.parent,
-                );
-            }
-            ChildOfElement::Text(n) => {
-                let n = unsafe { &mut *n };
-
-                if let Some(prev_parent) = n.parent {
-                    let prev_parent_r = unsafe { &mut *prev_parent };
-                    prev_parent_r.children.retain(|n| n != self);
-                }
-
-                n.parent = Some(parent);
-            }
-        };
-    }
-
-    fn remove_parent(&self) {
-        match *self {
-            ChildOfElement::Element(n) => {
-                let n = unsafe { &mut *n };
-                n.parent = None;
-            }
-            ChildOfElement::Comment(n) => {
-                let n = unsafe { &mut *n };
-                n.parent = None;
-            }
-            ChildOfElement::ProcessingInstruction(n) => {
-                let n = unsafe { &mut *n };
-                n.parent = None;
-            }
-            ChildOfElement::Text(n) => {
-                let n = unsafe { &mut *n };
-                n.parent = None;
-            }
-        };
-    }
+    Element(Index<Element>),
+    Text(Index<Text>),
+    Comment(Index<Comment>),
+    ProcessingInstruction(Index<ProcessingInstruction>),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ParentOfChild {
-    Root(*mut Root),
-    Element(*mut Element),
+    Root(Index<Root>),
+    Element(Index<Element>),
 }
+
+// --- Conversion traits ---
 
 macro_rules! conversion_trait(
     ($res_type:ident, {
         $($leaf_type:ident => $variant:expr),*
     }) => (
-        $(impl From<*mut $leaf_type> for $res_type {
-            fn from(v: *mut $leaf_type) -> $res_type {
+        $(impl From<Index<$leaf_type>> for $res_type {
+            fn from(v: Index<$leaf_type>) -> $res_type {
                 $variant(v)
             }
         })*
@@ -286,26 +202,28 @@ impl From<ChildOfRoot> for ChildOfElement {
     }
 }
 
+// --- Storage ---
+
 pub struct Storage {
     strings: StringPool,
-    roots: Arena<Root>,
-    elements: Arena<Element>,
-    attributes: Arena<Attribute>,
-    texts: Arena<Text>,
-    comments: Arena<Comment>,
-    processing_instructions: Arena<ProcessingInstruction>,
+    pub(crate) roots: RefCell<Vec<Root>>,
+    pub(crate) elements: RefCell<Vec<Element>>,
+    pub(crate) attributes: RefCell<Vec<Attribute>>,
+    pub(crate) texts: RefCell<Vec<Text>>,
+    pub(crate) comments: RefCell<Vec<Comment>>,
+    pub(crate) processing_instructions: RefCell<Vec<ProcessingInstruction>>,
 }
 
 impl Default for Storage {
     fn default() -> Storage {
         Storage {
             strings: StringPool::new(),
-            roots: Arena::new(),
-            elements: Arena::new(),
-            attributes: Arena::new(),
-            texts: Arena::new(),
-            comments: Arena::new(),
-            processing_instructions: Arena::new(),
+            roots: RefCell::new(Vec::new()),
+            elements: RefCell::new(Vec::new()),
+            attributes: RefCell::new(Vec::new()),
+            texts: RefCell::new(Vec::new()),
+            comments: RefCell::new(Vec::new()),
+            processing_instructions: RefCell::new(Vec::new()),
         }
     }
 }
@@ -316,8 +234,7 @@ impl Storage {
     }
 
     fn intern(&self, s: &str) -> InternedString {
-        let interned = self.strings.intern(s);
-        InternedString::from_str(interned)
+        self.strings.intern(s)
     }
 
     fn intern_qname(&self, q: QName<'_>) -> InternedQName {
@@ -327,20 +244,23 @@ impl Storage {
         }
     }
 
-    pub fn create_root(&self) -> *mut Root {
-        self.roots.alloc(Root {
+    pub fn create_root(&self) -> Index<Root> {
+        let mut roots = self.roots.borrow_mut();
+        let idx = roots.len();
+        roots.push(Root {
             children: Vec::new(),
-        })
+        });
+        Index::new(idx)
     }
 
-    pub fn create_element<'n, N>(&self, name: N) -> *mut Element
+    pub fn create_element<'n, N>(&self, name: N) -> Index<Element>
     where
         N: Into<QName<'n>>,
     {
-        let name = name.into();
-        let name = self.intern_qname(name);
-
-        self.elements.alloc(Element {
+        let name = self.intern_qname(name.into());
+        let mut elements = self.elements.borrow_mut();
+        let idx = elements.len();
+        elements.push(Element {
             name,
             default_namespace_uri: None,
             preferred_prefix: None,
@@ -348,553 +268,677 @@ impl Storage {
             parent: None,
             attributes: Vec::new(),
             prefix_to_namespace: LazyHashMap::new(),
-        })
+        });
+        Index::new(idx)
     }
 
-    pub fn create_attribute<'n, N>(&self, name: N, value: &str) -> *mut Attribute
+    pub fn create_attribute<'n, N>(&self, name: N, value: &str) -> Index<Attribute>
     where
         N: Into<QName<'n>>,
     {
-        let name = name.into();
-        let name = self.intern_qname(name);
+        let name = self.intern_qname(name.into());
         let value = self.intern(value);
-
-        self.attributes.alloc(Attribute {
+        let mut attributes = self.attributes.borrow_mut();
+        let idx = attributes.len();
+        attributes.push(Attribute {
             name,
             preferred_prefix: None,
             value,
             parent: None,
-        })
+        });
+        Index::new(idx)
     }
 
-    pub fn create_text(&self, text: &str) -> *mut Text {
+    pub fn create_text(&self, text: &str) -> Index<Text> {
         let text = self.intern(text);
-
-        self.texts.alloc(Text { text, parent: None })
+        let mut texts = self.texts.borrow_mut();
+        let idx = texts.len();
+        texts.push(Text { text, parent: None });
+        Index::new(idx)
     }
 
-    pub fn create_comment(&self, text: &str) -> *mut Comment {
+    pub fn create_comment(&self, text: &str) -> Index<Comment> {
         let text = self.intern(text);
-
-        self.comments.alloc(Comment { text, parent: None })
+        let mut comments = self.comments.borrow_mut();
+        let idx = comments.len();
+        comments.push(Comment { text, parent: None });
+        Index::new(idx)
     }
 
     pub fn create_processing_instruction(
         &self,
         target: &str,
         value: Option<&str>,
-    ) -> *mut ProcessingInstruction {
+    ) -> Index<ProcessingInstruction> {
         let target = self.intern(target);
         let value = value.map(|v| self.intern(v));
-
-        self.processing_instructions.alloc(ProcessingInstruction {
+        let mut pis = self.processing_instructions.borrow_mut();
+        let idx = pis.len();
+        pis.push(ProcessingInstruction {
             target,
             value,
             parent: None,
-        })
+        });
+        Index::new(idx)
     }
 
-    pub fn element_set_name<'n, N>(&self, element: *mut Element, name: N)
+    pub fn element_set_name<'n, N>(&self, element: Index<Element>, name: N)
     where
         N: Into<QName<'n>>,
     {
-        let name = name.into();
-        let name = self.intern_qname(name);
-        let element_r = unsafe { &mut *element };
-        element_r.name = name;
+        let name = self.intern_qname(name.into());
+        self.elements.borrow_mut()[element.idx].name = name;
     }
 
     pub fn element_register_prefix(
         &self,
-        element: *mut Element,
+        element: Index<Element>,
         prefix: &str,
         namespace_uri: &str,
     ) {
         let prefix = self.intern(prefix);
         let namespace_uri = self.intern(namespace_uri);
-        let element_r = unsafe { &mut *element };
-        element_r.prefix_to_namespace.insert(prefix, namespace_uri);
+        self.elements.borrow_mut()[element.idx]
+            .prefix_to_namespace
+            .insert(prefix, namespace_uri);
     }
 
     pub fn element_set_default_namespace_uri(
         &self,
-        element: *mut Element,
+        element: Index<Element>,
         namespace_uri: Option<&str>,
     ) {
         let namespace_uri = namespace_uri.map(|p| self.intern(p));
-        let element_r = unsafe { &mut *element };
-        element_r.default_namespace_uri = namespace_uri;
+        self.elements.borrow_mut()[element.idx].default_namespace_uri = namespace_uri;
     }
 
-    pub fn element_set_preferred_prefix(&self, element: *mut Element, prefix: Option<&str>) {
+    pub fn element_set_preferred_prefix(&self, element: Index<Element>, prefix: Option<&str>) {
         let prefix = prefix.map(|p| self.intern(p));
-        let element_r = unsafe { &mut *element };
-        element_r.preferred_prefix = prefix;
+        self.elements.borrow_mut()[element.idx].preferred_prefix = prefix;
     }
 
-    pub fn attribute_set_preferred_prefix(&self, attribute: *mut Attribute, prefix: Option<&str>) {
+    pub fn attribute_set_preferred_prefix(
+        &self,
+        attribute: Index<Attribute>,
+        prefix: Option<&str>,
+    ) {
         let prefix = prefix.map(|p| self.intern(p));
-        let attribute_r = unsafe { &mut *attribute };
-        attribute_r.preferred_prefix = prefix;
+        self.attributes.borrow_mut()[attribute.idx].preferred_prefix = prefix;
     }
 
-    pub fn text_set_text(&self, text: *mut Text, new_text: &str) {
+    pub fn text_set_text(&self, text: Index<Text>, new_text: &str) {
         let new_text = self.intern(new_text);
-        let text_r = unsafe { &mut *text };
-        text_r.text = new_text;
+        self.texts.borrow_mut()[text.idx].text = new_text;
     }
 
-    pub fn comment_set_text(&self, comment: *mut Comment, new_text: &str) {
+    pub fn comment_set_text(&self, comment: Index<Comment>, new_text: &str) {
         let new_text = self.intern(new_text);
-        let comment_r = unsafe { &mut *comment };
-        comment_r.text = new_text;
+        self.comments.borrow_mut()[comment.idx].text = new_text;
     }
 
     pub fn processing_instruction_set_target(
         &self,
-        pi: *mut ProcessingInstruction,
+        pi: Index<ProcessingInstruction>,
         new_target: &str,
     ) {
         let new_target = self.intern(new_target);
-        let pi_r = unsafe { &mut *pi };
-        pi_r.target = new_target;
+        self.processing_instructions.borrow_mut()[pi.idx].target = new_target;
     }
 
     pub fn processing_instruction_set_value(
         &self,
-        pi: *mut ProcessingInstruction,
+        pi: Index<ProcessingInstruction>,
         new_value: Option<&str>,
     ) {
         let new_value = new_value.map(|v| self.intern(v));
-        let pi_r = unsafe { &mut *pi };
-        pi_r.value = new_value;
+        self.processing_instructions.borrow_mut()[pi.idx].value = new_value;
+    }
+
+    // --- Accessors that clone data out of RefCells ---
+
+    pub fn element_name(&self, element: Index<Element>) -> QNameValue {
+        let elements = self.elements.borrow();
+        let e = &elements[element.idx];
+        QNameValue {
+            namespace_uri: e.name.namespace_uri.clone(),
+            local_part: e.name.local_part.clone(),
+        }
+    }
+
+    pub fn element_default_namespace_uri(&self, element: Index<Element>) -> Option<InternedString> {
+        self.elements.borrow()[element.idx]
+            .default_namespace_uri
+            .clone()
+    }
+
+    pub fn element_preferred_prefix(&self, element: Index<Element>) -> Option<InternedString> {
+        self.elements.borrow()[element.idx].preferred_prefix.clone()
+    }
+
+    pub fn attribute_name(&self, attribute: Index<Attribute>) -> QNameValue {
+        let attributes = self.attributes.borrow();
+        let a = &attributes[attribute.idx];
+        QNameValue {
+            namespace_uri: a.name.namespace_uri.clone(),
+            local_part: a.name.local_part.clone(),
+        }
+    }
+
+    pub fn attribute_value(&self, attribute: Index<Attribute>) -> InternedString {
+        self.attributes.borrow()[attribute.idx].value.clone()
+    }
+
+    pub fn attribute_preferred_prefix(
+        &self,
+        attribute: Index<Attribute>,
+    ) -> Option<InternedString> {
+        self.attributes.borrow()[attribute.idx]
+            .preferred_prefix
+            .clone()
+    }
+
+    pub fn text_text(&self, text: Index<Text>) -> InternedString {
+        self.texts.borrow()[text.idx].text.clone()
+    }
+
+    pub fn comment_text(&self, comment: Index<Comment>) -> InternedString {
+        self.comments.borrow()[comment.idx].text.clone()
+    }
+
+    pub fn pi_target(&self, pi: Index<ProcessingInstruction>) -> InternedString {
+        self.processing_instructions.borrow()[pi.idx].target.clone()
+    }
+
+    pub fn pi_value(&self, pi: Index<ProcessingInstruction>) -> Option<InternedString> {
+        self.processing_instructions.borrow()[pi.idx].value.clone()
     }
 }
 
+// --- Connections ---
+
 pub struct Connections {
-    root: *mut Root,
+    root: Index<Root>,
 }
 
 impl Connections {
-    pub fn new(root: *mut Root) -> Connections {
+    pub fn new(root: Index<Root>) -> Connections {
         Connections { root }
     }
 
-    pub fn root(&self) -> *mut Root {
+    pub fn root(&self) -> Index<Root> {
         self.root
     }
 
-    pub fn element_parent(&self, child: *mut Element) -> Option<ParentOfChild> {
-        let child_r = unsafe { &*child };
-        child_r.parent
+    // --- Parent accessors ---
+
+    pub fn element_parent(
+        &self,
+        storage: &Storage,
+        child: Index<Element>,
+    ) -> Option<ParentOfChild> {
+        storage.elements.borrow()[child.idx].parent
     }
 
-    pub fn text_parent(&self, child: *mut Text) -> Option<*mut Element> {
-        let child_r = unsafe { &*child };
-        child_r.parent
+    pub fn text_parent(&self, storage: &Storage, child: Index<Text>) -> Option<Index<Element>> {
+        storage.texts.borrow()[child.idx].parent
     }
 
-    pub fn comment_parent(&self, child: *mut Comment) -> Option<ParentOfChild> {
-        let child_r = unsafe { &*child };
-        child_r.parent
+    pub fn comment_parent(
+        &self,
+        storage: &Storage,
+        child: Index<Comment>,
+    ) -> Option<ParentOfChild> {
+        storage.comments.borrow()[child.idx].parent
     }
 
     pub fn processing_instruction_parent(
         &self,
-        child: *mut ProcessingInstruction,
+        storage: &Storage,
+        child: Index<ProcessingInstruction>,
     ) -> Option<ParentOfChild> {
-        let child_r = unsafe { &*child };
-        child_r.parent
+        storage.processing_instructions.borrow()[child.idx].parent
     }
 
-    pub fn append_root_child<C>(&self, child: C)
+    // --- Child management ---
+
+    pub fn append_root_child<C>(&self, storage: &Storage, child: C)
     where
         C: Into<ChildOfRoot>,
     {
         let child = child.into();
-        child.replace_parent(self.root);
-
-        let parent_r = unsafe { &mut *self.root };
-        parent_r.children.push(child);
+        self.replace_root_child_parent(storage, child);
+        storage.roots.borrow_mut()[self.root.idx]
+            .children
+            .push(child);
     }
 
-    pub fn append_element_child<C>(&self, parent: *mut Element, child: C)
+    pub fn append_element_child<C>(&self, storage: &Storage, parent: Index<Element>, child: C)
     where
         C: Into<ChildOfElement>,
     {
         let child = child.into();
-        let parent_r = unsafe { &mut *parent };
-
-        child.replace_parent(parent);
-        parent_r.children.push(child);
+        self.replace_element_child_parent(storage, parent, child);
+        storage.elements.borrow_mut()[parent.idx]
+            .children
+            .push(child);
     }
 
-    pub fn remove_root_child<C>(&self, child: C)
+    pub fn remove_root_child<C>(&self, storage: &Storage, child: C)
     where
         C: Into<ChildOfRoot>,
     {
-        let parent_r = unsafe { &mut *self.root };
         let child = child.into();
-        child.remove_parent();
-        parent_r.children.retain(|&x| x != child);
+        self.clear_child_parent(storage, child.into());
+        storage.roots.borrow_mut()[self.root.idx]
+            .children
+            .retain(|&x| x != child);
     }
 
-    pub fn remove_element_child<C>(&self, parent: *mut Element, child: C)
+    pub fn remove_element_child<C>(&self, storage: &Storage, parent: Index<Element>, child: C)
     where
         C: Into<ChildOfElement>,
     {
-        let parent_r = unsafe { &mut *parent };
         let child = child.into();
-        child.remove_parent();
-        parent_r.children.retain(|&x| x != child);
+        self.clear_child_parent(storage, child);
+        storage.elements.borrow_mut()[parent.idx]
+            .children
+            .retain(|&x| x != child);
     }
 
-    pub fn clear_root_children(&self) {
-        let parent_r = unsafe { &mut *self.root };
-        for c in &mut parent_r.children {
-            c.remove_parent();
+    pub fn clear_root_children(&self, storage: &Storage) {
+        let children: Vec<ChildOfRoot> = storage.roots.borrow()[self.root.idx].children.clone();
+        for c in &children {
+            self.clear_child_parent(storage, (*c).into());
         }
-        parent_r.children.clear();
+        storage.roots.borrow_mut()[self.root.idx].children.clear();
     }
 
-    pub fn clear_element_children(&self, parent: *mut Element) {
-        let parent_r = unsafe { &mut *parent };
-        for c in &mut parent_r.children {
-            c.remove_parent();
+    pub fn clear_element_children(&self, storage: &Storage, parent: Index<Element>) {
+        let children: Vec<ChildOfElement> = storage.elements.borrow()[parent.idx].children.clone();
+        for c in &children {
+            self.clear_child_parent(storage, *c);
         }
-        parent_r.children.clear();
+        storage.elements.borrow_mut()[parent.idx].children.clear();
     }
 
-    pub fn remove_element_from_parent(&self, child: *mut Element) {
-        let child_r = unsafe { &mut *child };
-        match child_r.parent {
-            Some(ParentOfChild::Root(_)) => self.remove_root_child(child),
-            Some(ParentOfChild::Element(parent)) => self.remove_element_child(parent, child),
-            None => { /* no-op */ }
-        }
-    }
+    // --- Parent removal ---
 
-    pub fn remove_attribute_from_parent(&self, child: *mut Attribute) {
-        let child_r = unsafe { &mut *child };
-        if let Some(parent) = child_r.parent {
-            self.remove_attribute_x(parent, |attr| std::ptr::eq(attr, child));
+    pub fn remove_element_from_parent(&self, storage: &Storage, child: Index<Element>) {
+        let parent = storage.elements.borrow()[child.idx].parent;
+        match parent {
+            Some(ParentOfChild::Root(_)) => self.remove_root_child(storage, child),
+            Some(ParentOfChild::Element(p)) => self.remove_element_child(storage, p, child),
+            None => {}
         }
     }
 
-    pub fn remove_text_from_parent(&self, child: *mut Text) {
-        let child_r = unsafe { &mut *child };
-        if let Some(parent) = child_r.parent {
-            self.remove_element_child(parent, child);
+    pub fn remove_attribute_from_parent(&self, storage: &Storage, child: Index<Attribute>) {
+        let parent = storage.attributes.borrow()[child.idx].parent;
+        if let Some(parent_idx) = parent {
+            self.remove_attribute_x(storage, parent_idx, |idx| idx == child);
         }
     }
 
-    pub fn remove_comment_from_parent(&self, child: *mut Comment) {
-        let child_r = unsafe { &mut *child };
-        match child_r.parent {
-            Some(ParentOfChild::Root(_)) => self.remove_root_child(child),
-            Some(ParentOfChild::Element(parent)) => self.remove_element_child(parent, child),
-            None => { /* no-op */ }
+    pub fn remove_text_from_parent(&self, storage: &Storage, child: Index<Text>) {
+        let parent = storage.texts.borrow()[child.idx].parent;
+        if let Some(parent_idx) = parent {
+            self.remove_element_child(storage, parent_idx, child);
         }
     }
 
-    pub fn remove_processing_instruction_from_parent(&self, child: *mut ProcessingInstruction) {
-        let child_r = unsafe { &mut *child };
-        match child_r.parent {
-            Some(ParentOfChild::Root(_)) => self.remove_root_child(child),
-            Some(ParentOfChild::Element(parent)) => self.remove_element_child(parent, child),
-            None => { /* no-op */ }
+    pub fn remove_comment_from_parent(&self, storage: &Storage, child: Index<Comment>) {
+        let parent = storage.comments.borrow()[child.idx].parent;
+        match parent {
+            Some(ParentOfChild::Root(_)) => self.remove_root_child(storage, child),
+            Some(ParentOfChild::Element(p)) => self.remove_element_child(storage, p, child),
+            None => {}
         }
     }
 
-    pub fn root_children(&self) -> &[ChildOfRoot] {
-        let parent_r = unsafe { &*self.root };
-        &parent_r.children
-    }
-
-    pub fn element_children(&self, parent: *mut Element) -> &[ChildOfElement] {
-        let parent_r = unsafe { &*parent };
-        &parent_r.children
-    }
-
-    /// Returns the sibling nodes that come before this node. The
-    /// nodes are in document order.
-    pub fn element_preceding_siblings(&self, element: *mut Element) -> SiblingIter<'_> {
-        let element_r = unsafe { &*element };
-        match element_r.parent {
-            Some(ParentOfChild::Root(root_parent)) => SiblingIter::of_root(
-                SiblingDirection::Preceding,
-                root_parent,
-                ChildOfRoot::Element(element),
-            ),
-            Some(ParentOfChild::Element(element_parent)) => SiblingIter::of_element(
-                SiblingDirection::Preceding,
-                element_parent,
-                ChildOfElement::Element(element),
-            ),
-            None => SiblingIter::dead(),
+    pub fn remove_processing_instruction_from_parent(
+        &self,
+        storage: &Storage,
+        child: Index<ProcessingInstruction>,
+    ) {
+        let parent = storage.processing_instructions.borrow()[child.idx].parent;
+        match parent {
+            Some(ParentOfChild::Root(_)) => self.remove_root_child(storage, child),
+            Some(ParentOfChild::Element(p)) => self.remove_element_child(storage, p, child),
+            None => {}
         }
     }
 
-    /// Returns the sibling nodes that come after this node. The
-    /// nodes are in document order.
-    pub fn element_following_siblings(&self, element: *mut Element) -> SiblingIter<'_> {
-        let element_r = unsafe { &*element };
-        match element_r.parent {
-            Some(ParentOfChild::Root(root_parent)) => SiblingIter::of_root(
-                SiblingDirection::Following,
-                root_parent,
-                ChildOfRoot::Element(element),
-            ),
-            Some(ParentOfChild::Element(element_parent)) => SiblingIter::of_element(
-                SiblingDirection::Following,
-                element_parent,
-                ChildOfElement::Element(element),
-            ),
-            None => SiblingIter::dead(),
-        }
+    // --- Children/sibling accessors ---
+
+    pub fn root_children(&self, storage: &Storage) -> Vec<ChildOfRoot> {
+        storage.roots.borrow()[self.root.idx].children.clone()
     }
 
-    /// Returns the sibling nodes that come before this node. The
-    /// nodes are in document order.
-    pub fn text_preceding_siblings(&self, text: *mut Text) -> SiblingIter<'_> {
-        let text_r = unsafe { &*text };
-        match text_r.parent {
-            Some(element_parent) => SiblingIter::of_element(
-                SiblingDirection::Preceding,
-                element_parent,
-                ChildOfElement::Text(text),
-            ),
-            None => SiblingIter::dead(),
-        }
+    pub fn element_children(
+        &self,
+        storage: &Storage,
+        parent: Index<Element>,
+    ) -> Vec<ChildOfElement> {
+        storage.elements.borrow()[parent.idx].children.clone()
     }
 
-    /// Returns the sibling nodes that come after this node. The
-    /// nodes are in document order.
-    pub fn text_following_siblings(&self, text: *mut Text) -> SiblingIter<'_> {
-        let text_r = unsafe { &*text };
-        match text_r.parent {
-            Some(element_parent) => SiblingIter::of_element(
-                SiblingDirection::Following,
-                element_parent,
-                ChildOfElement::Text(text),
-            ),
-            None => SiblingIter::dead(),
-        }
+    pub fn element_preceding_siblings(
+        &self,
+        storage: &Storage,
+        element: Index<Element>,
+    ) -> Vec<ChildOfElement> {
+        let parent = storage.elements.borrow()[element.idx].parent;
+        self.preceding_siblings_impl(storage, parent, ChildOfElement::Element(element))
     }
 
-    /// Returns the sibling nodes that come before this node. The
-    /// nodes are in document order.
-    pub fn comment_preceding_siblings(&self, comment: *mut Comment) -> SiblingIter<'_> {
-        let comment_r = unsafe { &*comment };
-        match comment_r.parent {
-            Some(ParentOfChild::Root(root_parent)) => SiblingIter::of_root(
-                SiblingDirection::Preceding,
-                root_parent,
-                ChildOfRoot::Comment(comment),
-            ),
-            Some(ParentOfChild::Element(element_parent)) => SiblingIter::of_element(
-                SiblingDirection::Preceding,
-                element_parent,
-                ChildOfElement::Comment(comment),
-            ),
-            None => SiblingIter::dead(),
-        }
+    pub fn element_following_siblings(
+        &self,
+        storage: &Storage,
+        element: Index<Element>,
+    ) -> Vec<ChildOfElement> {
+        let parent = storage.elements.borrow()[element.idx].parent;
+        self.following_siblings_impl(storage, parent, ChildOfElement::Element(element))
     }
 
-    /// Returns the sibling nodes that come after this node. The
-    /// nodes are in document order.
-    pub fn comment_following_siblings(&self, comment: *mut Comment) -> SiblingIter<'_> {
-        let comment_r = unsafe { &*comment };
-        match comment_r.parent {
-            Some(ParentOfChild::Root(root_parent)) => SiblingIter::of_root(
-                SiblingDirection::Following,
-                root_parent,
-                ChildOfRoot::Comment(comment),
-            ),
-            Some(ParentOfChild::Element(element_parent)) => SiblingIter::of_element(
-                SiblingDirection::Following,
-                element_parent,
-                ChildOfElement::Comment(comment),
-            ),
-            None => SiblingIter::dead(),
-        }
+    pub fn text_preceding_siblings(
+        &self,
+        storage: &Storage,
+        text: Index<Text>,
+    ) -> Vec<ChildOfElement> {
+        let parent = storage.texts.borrow()[text.idx]
+            .parent
+            .map(ParentOfChild::Element);
+        self.preceding_siblings_impl(storage, parent, ChildOfElement::Text(text))
     }
 
-    /// Returns the sibling nodes that come before this node. The
-    /// nodes are in document order.
+    pub fn text_following_siblings(
+        &self,
+        storage: &Storage,
+        text: Index<Text>,
+    ) -> Vec<ChildOfElement> {
+        let parent = storage.texts.borrow()[text.idx]
+            .parent
+            .map(ParentOfChild::Element);
+        self.following_siblings_impl(storage, parent, ChildOfElement::Text(text))
+    }
+
+    pub fn comment_preceding_siblings(
+        &self,
+        storage: &Storage,
+        comment: Index<Comment>,
+    ) -> Vec<ChildOfElement> {
+        let parent = storage.comments.borrow()[comment.idx].parent;
+        self.preceding_siblings_impl(storage, parent, ChildOfElement::Comment(comment))
+    }
+
+    pub fn comment_following_siblings(
+        &self,
+        storage: &Storage,
+        comment: Index<Comment>,
+    ) -> Vec<ChildOfElement> {
+        let parent = storage.comments.borrow()[comment.idx].parent;
+        self.following_siblings_impl(storage, parent, ChildOfElement::Comment(comment))
+    }
+
     pub fn processing_instruction_preceding_siblings(
         &self,
-        pi: *mut ProcessingInstruction,
-    ) -> SiblingIter<'_> {
-        let pi_r = unsafe { &*pi };
-        match pi_r.parent {
-            Some(ParentOfChild::Root(root_parent)) => SiblingIter::of_root(
-                SiblingDirection::Preceding,
-                root_parent,
-                ChildOfRoot::ProcessingInstruction(pi),
-            ),
-            Some(ParentOfChild::Element(element_parent)) => SiblingIter::of_element(
-                SiblingDirection::Preceding,
-                element_parent,
-                ChildOfElement::ProcessingInstruction(pi),
-            ),
-            None => SiblingIter::dead(),
-        }
+        storage: &Storage,
+        pi: Index<ProcessingInstruction>,
+    ) -> Vec<ChildOfElement> {
+        let parent = storage.processing_instructions.borrow()[pi.idx].parent;
+        self.preceding_siblings_impl(storage, parent, ChildOfElement::ProcessingInstruction(pi))
     }
 
-    /// Returns the sibling nodes that come after this node. The
-    /// nodes are in document order.
     pub fn processing_instruction_following_siblings(
         &self,
-        pi: *mut ProcessingInstruction,
-    ) -> SiblingIter<'_> {
-        let pi_r = unsafe { &*pi };
-        match pi_r.parent {
-            Some(ParentOfChild::Root(root_parent)) => SiblingIter::of_root(
-                SiblingDirection::Following,
-                root_parent,
-                ChildOfRoot::ProcessingInstruction(pi),
-            ),
-            Some(ParentOfChild::Element(element_parent)) => SiblingIter::of_element(
-                SiblingDirection::Following,
-                element_parent,
-                ChildOfElement::ProcessingInstruction(pi),
-            ),
-            None => SiblingIter::dead(),
+        storage: &Storage,
+        pi: Index<ProcessingInstruction>,
+    ) -> Vec<ChildOfElement> {
+        let parent = storage.processing_instructions.borrow()[pi.idx].parent;
+        self.following_siblings_impl(storage, parent, ChildOfElement::ProcessingInstruction(pi))
+    }
+
+    fn preceding_siblings_impl(
+        &self,
+        storage: &Storage,
+        parent: Option<ParentOfChild>,
+        child: ChildOfElement,
+    ) -> Vec<ChildOfElement> {
+        match parent {
+            Some(ParentOfChild::Root(root_idx)) => {
+                let roots = storage.roots.borrow();
+                let children = &roots[root_idx.idx].children;
+                let child_as_root = match child {
+                    ChildOfElement::Element(n) => ChildOfRoot::Element(n),
+                    ChildOfElement::Comment(n) => ChildOfRoot::Comment(n),
+                    ChildOfElement::ProcessingInstruction(n) => {
+                        ChildOfRoot::ProcessingInstruction(n)
+                    }
+                    _ => return Vec::new(),
+                };
+                let pos = children.iter().position(|c| *c == child_as_root).unwrap();
+                children[..pos].iter().map(|&c| c.into()).collect()
+            }
+            Some(ParentOfChild::Element(parent_idx)) => {
+                let elements = storage.elements.borrow();
+                let children = &elements[parent_idx.idx].children;
+                let pos = children.iter().position(|c| *c == child).unwrap();
+                children[..pos].to_vec()
+            }
+            None => Vec::new(),
         }
     }
 
-    pub fn attribute_parent(&self, attribute: *mut Attribute) -> Option<*mut Element> {
-        let attr_r = unsafe { &*attribute };
-        attr_r.parent
+    fn following_siblings_impl(
+        &self,
+        storage: &Storage,
+        parent: Option<ParentOfChild>,
+        child: ChildOfElement,
+    ) -> Vec<ChildOfElement> {
+        match parent {
+            Some(ParentOfChild::Root(root_idx)) => {
+                let roots = storage.roots.borrow();
+                let children = &roots[root_idx.idx].children;
+                let child_as_root = match child {
+                    ChildOfElement::Element(n) => ChildOfRoot::Element(n),
+                    ChildOfElement::Comment(n) => ChildOfRoot::Comment(n),
+                    ChildOfElement::ProcessingInstruction(n) => {
+                        ChildOfRoot::ProcessingInstruction(n)
+                    }
+                    _ => return Vec::new(),
+                };
+                let pos = children.iter().position(|c| *c == child_as_root).unwrap();
+                children[pos + 1..].iter().map(|&c| c.into()).collect()
+            }
+            Some(ParentOfChild::Element(parent_idx)) => {
+                let elements = storage.elements.borrow();
+                let children = &elements[parent_idx.idx].children;
+                let pos = children.iter().position(|c| *c == child).unwrap();
+                children[pos + 1..].to_vec()
+            }
+            None => Vec::new(),
+        }
     }
 
-    pub fn attributes(&self, parent: *mut Element) -> &[*mut Attribute] {
-        let parent_r = unsafe { &*parent };
-        &parent_r.attributes
+    // --- Attribute management ---
+
+    pub fn attribute_parent(
+        &self,
+        storage: &Storage,
+        attribute: Index<Attribute>,
+    ) -> Option<Index<Element>> {
+        storage.attributes.borrow()[attribute.idx].parent
     }
 
-    pub fn attribute<'n, N>(&self, element: *mut Element, name: N) -> Option<*mut Attribute>
+    pub fn attributes(&self, storage: &Storage, parent: Index<Element>) -> Vec<Index<Attribute>> {
+        storage.elements.borrow()[parent.idx].attributes.clone()
+    }
+
+    pub fn attribute<'n, N>(
+        &self,
+        storage: &Storage,
+        element: Index<Element>,
+        name: N,
+    ) -> Option<Index<Attribute>>
     where
         N: Into<QName<'n>>,
     {
         let name = name.into();
-        let element_r = unsafe { &*element };
-        element_r
+        let elements = storage.elements.borrow();
+        let attributes = storage.attributes.borrow();
+        elements[element.idx]
             .attributes
             .iter()
-            .find(|a| {
-                let a_r: &Attribute = unsafe { &***a };
-                a_r.name.as_qname() == name
-            })
-            .cloned()
+            .find(|&&a_idx| attributes[a_idx.idx].name.as_qname() == name)
+            .copied()
     }
 
-    pub fn remove_attribute<'n, N>(&self, element: *mut Element, name: N)
+    pub fn remove_attribute<'n, N>(&self, storage: &Storage, element: Index<Element>, name: N)
     where
         N: Into<QName<'n>>,
     {
         let name = name.into();
-        self.remove_attribute_x(element, |a| a.name.as_qname() == name)
-    }
-
-    pub fn remove_attribute_x<F>(&self, element: *mut Element, mut pred: F)
-    where
-        F: FnMut(&mut Attribute) -> bool,
-    {
-        let element_r = unsafe { &mut *element };
-
-        element_r.attributes.retain(|&a| {
-            let a_r = unsafe { &mut *a };
-            let is_this_attr = pred(a_r);
-            if is_this_attr {
-                a_r.parent = None;
-            }
-            !is_this_attr
+        self.remove_attribute_x(storage, element, |a_idx| {
+            storage.attributes.borrow()[a_idx.idx].name.as_qname() == name
         })
     }
 
-    pub fn set_attribute(&self, parent: *mut Element, attribute: *mut Attribute) {
-        let parent_r = unsafe { &mut *parent };
-        let attr_r = unsafe { &mut *attribute };
-
-        if let Some(prev_parent) = attr_r.parent {
-            let prev_parent_r = unsafe { &mut *prev_parent };
-            prev_parent_r.attributes.retain(|&a| a != attribute);
+    pub fn remove_attribute_x<F>(&self, storage: &Storage, element: Index<Element>, mut pred: F)
+    where
+        F: FnMut(Index<Attribute>) -> bool,
+    {
+        let attr_indices: Vec<Index<Attribute>> =
+            storage.elements.borrow()[element.idx].attributes.clone();
+        let mut to_keep = Vec::new();
+        for a_idx in attr_indices {
+            if pred(a_idx) {
+                storage.attributes.borrow_mut()[a_idx.idx].parent = None;
+            } else {
+                to_keep.push(a_idx);
+            }
         }
-
-        parent_r.attributes.retain(|a| {
-            let a_r: &Attribute = unsafe { &**a };
-            a_r.name.as_qname() != attr_r.name.as_qname()
-        });
-        parent_r.attributes.push(attribute);
-        attr_r.parent = Some(parent);
+        storage.elements.borrow_mut()[element.idx].attributes = to_keep;
     }
 
-    fn element_parents(&self, element: *mut Element) -> ElementParents<'_> {
-        ElementParents {
-            element: Some(element),
-            marker: PhantomData,
+    pub fn set_attribute(
+        &self,
+        storage: &Storage,
+        parent: Index<Element>,
+        attribute: Index<Attribute>,
+    ) {
+        let prev_parent = storage.attributes.borrow()[attribute.idx].parent;
+        if let Some(prev_parent_idx) = prev_parent {
+            storage.elements.borrow_mut()[prev_parent_idx.idx]
+                .attributes
+                .retain(|&a| a != attribute);
         }
+
+        let attr_name = {
+            let attrs = storage.attributes.borrow();
+            attrs[attribute.idx].name.clone()
+        };
+        {
+            let mut elements = storage.elements.borrow_mut();
+            let attrs_ref = storage.attributes.borrow();
+            elements[parent.idx]
+                .attributes
+                .retain(|&a| attrs_ref[a.idx].name.as_qname() != attr_name.as_qname());
+        }
+        storage.elements.borrow_mut()[parent.idx]
+            .attributes
+            .push(attribute);
+        storage.attributes.borrow_mut()[attribute.idx].parent = Some(parent);
     }
+
+    // --- Namespace resolution ---
 
     pub fn element_namespace_uri_for_prefix(
         &self,
-        element: *mut Element,
+        storage: &Storage,
+        element: Index<Element>,
         prefix: &str,
-    ) -> Option<&str> {
-        self.element_parents(element)
-            .filter_map(|e| e.prefix_to_namespace.get(prefix))
-            .next()
-            .map(|s| s.as_slice())
+    ) -> Option<InternedString> {
+        let mut current = Some(element);
+        while let Some(elem_idx) = current {
+            let elements = storage.elements.borrow();
+            let elem = &elements[elem_idx.idx];
+            if let Some(uri) = elem.prefix_to_namespace.get(prefix) {
+                return Some(uri.clone());
+            }
+            current = match elem.parent {
+                Some(ParentOfChild::Element(p)) => Some(p),
+                _ => None,
+            };
+        }
+        None
     }
 
     pub fn element_prefix_for_namespace_uri(
         &self,
-        element: *mut Element,
+        storage: &Storage,
+        element: Index<Element>,
         namespace_uri: &str,
         preferred_prefix: Option<&str>,
-    ) -> Option<&str> {
-        for element_r in self.element_parents(element) {
-            let prefixes: Vec<_> = element_r
+    ) -> Option<InternedString> {
+        let mut current = Some(element);
+        while let Some(elem_idx) = current {
+            let elements = storage.elements.borrow();
+            let elem = &elements[elem_idx.idx];
+
+            let prefixes: Vec<InternedString> = elem
                 .prefix_to_namespace
                 .iter()
-                .filter_map(|(&prefix, ns_uri)| {
-                    if ns_uri == namespace_uri {
-                        Some(prefix)
+                .filter_map(|(prefix, ns_uri)| {
+                    if &**ns_uri == namespace_uri {
+                        Some(prefix.clone())
                     } else {
                         None
                     }
                 })
                 .collect();
 
-            if let Some(preferred_prefix) = preferred_prefix {
-                if let Some(prefix) = prefixes.iter().find(|&prefix| prefix == preferred_prefix) {
-                    return Some(prefix.as_slice());
-                }
+            if let Some(preferred) = preferred_prefix
+                && let Some(p) = prefixes.iter().find(|p| &***p == preferred)
+            {
+                return Some(p.clone());
+            }
+            if let Some(p) = prefixes.first() {
+                return Some(p.clone());
             }
 
-            if let Some(prefix) = prefixes.first() {
-                return Some(prefix.as_slice());
-            }
+            current = match elem.parent {
+                Some(ParentOfChild::Element(p)) => Some(p),
+                _ => None,
+            };
         }
         None
     }
 
-    pub fn element_namespaces_in_scope(&self, element: *mut Element) -> NamespacesInScope<'_> {
-        let mut namespaces = Vec::new();
+    pub fn element_namespaces_in_scope(
+        &self,
+        storage: &Storage,
+        element: Index<Element>,
+    ) -> NamespacesInScope {
+        let mut namespaces: Vec<(String, String)> = Vec::new();
+        namespaces.push((
+            crate::XML_NS_PREFIX.to_owned(),
+            crate::XML_NS_URI.to_owned(),
+        ));
 
-        namespaces.push((crate::XML_NS_PREFIX, crate::XML_NS_URI));
-
-        let all_namespaces = self
-            .element_parents(element)
-            .flat_map(|e| e.prefix_to_namespace.iter());
-
-        for (&prefix, &uri) in all_namespaces {
-            let namespace = (prefix.as_slice(), uri.as_slice());
-            if !namespaces.iter().any(|ns| ns.0 == namespace.0) {
-                namespaces.push(namespace)
+        let mut current = Some(element);
+        while let Some(elem_idx) = current {
+            let elements = storage.elements.borrow();
+            let elem = &elements[elem_idx.idx];
+            for (prefix, uri) in elem.prefix_to_namespace.iter() {
+                let ns = (prefix.to_string(), uri.to_string());
+                if !namespaces.iter().any(|n| n.0 == ns.0) {
+                    namespaces.push(ns);
+                }
             }
+            current = match elem.parent {
+                Some(ParentOfChild::Element(p)) => Some(p),
+                _ => None,
+            };
         }
 
         NamespacesInScope {
@@ -902,119 +946,151 @@ impl Connections {
         }
     }
 
-    pub fn element_default_namespace_uri(&self, element: *mut Element) -> Option<&str> {
-        self.element_parents(element)
-            .filter_map(|e| e.default_namespace_uri())
-            .next()
+    pub fn element_recursive_default_namespace_uri(
+        &self,
+        storage: &Storage,
+        element: Index<Element>,
+    ) -> Option<InternedString> {
+        let mut current = Some(element);
+        while let Some(elem_idx) = current {
+            let elements = storage.elements.borrow();
+            let elem = &elements[elem_idx.idx];
+            if elem.default_namespace_uri.is_some() {
+                return elem.default_namespace_uri.clone();
+            }
+            current = match elem.parent {
+                Some(ParentOfChild::Element(p)) => Some(p),
+                _ => None,
+            };
+        }
+        None
     }
-}
 
-struct ElementParents<'a> {
-    element: Option<*const Element>,
-    marker: PhantomData<&'a Element>,
-}
+    // --- Internal helpers ---
 
-impl<'a> Iterator for ElementParents<'a> {
-    type Item = &'a Element;
+    fn replace_root_child_parent(&self, storage: &Storage, child: ChildOfRoot) {
+        match child {
+            ChildOfRoot::Element(n) => {
+                // Root may only have one element child; remove existing elements
+                storage.roots.borrow_mut()[self.root.idx]
+                    .children
+                    .retain(|c| !c.is_element());
 
-    fn next(&mut self) -> Option<&'a Element> {
-        let element_ref = match self.element {
-            None => return None,
-            Some(e) => unsafe { &*e },
-        };
-
-        self.element = match element_ref.parent {
-            Some(ParentOfChild::Element(parent)) => Some(parent),
-            _ => None,
-        };
-
-        Some(element_ref)
-    }
-}
-
-pub struct NamespacesInScope<'a> {
-    // There's probably a more efficient way instead of building up
-    // the entire vector, but this has the right API for now.
-    iter: ::std::vec::IntoIter<(&'a str, &'a str)>,
-}
-
-impl<'a> Iterator for NamespacesInScope<'a> {
-    type Item = (&'a str, &'a str);
-
-    fn next(&mut self) -> Option<(&'a str, &'a str)> {
-        self.iter.next()
-    }
-}
-
-enum SiblingDirection {
-    Preceding,
-    Following,
-}
-
-enum SiblingData<'a> {
-    FromRoot(slice::Iter<'a, ChildOfRoot>),
-    FromElement(slice::Iter<'a, ChildOfElement>),
-    Dead,
-}
-
-pub struct SiblingIter<'a> {
-    data: SiblingData<'a>,
-}
-
-impl<'a> SiblingIter<'a> {
-    fn of_root(
-        direction: SiblingDirection,
-        root_parent: *mut Root,
-        child: ChildOfRoot,
-    ) -> SiblingIter<'a> {
-        let root_parent_r = unsafe { &*root_parent };
-        let data = &root_parent_r.children;
-        let pos = data.iter().position(|c| *c == child).unwrap();
-
-        let data = match direction {
-            SiblingDirection::Preceding => &data[..pos],
-            SiblingDirection::Following => &data[pos + 1..],
-        };
-
-        SiblingIter {
-            data: SiblingData::FromRoot(data.iter()),
+                // Remove from previous parent
+                let old_parent = storage.elements.borrow()[n.idx].parent;
+                self.detach_from_old_parent(storage, ChildOfRoot::Element(n).into(), old_parent);
+                storage.elements.borrow_mut()[n.idx].parent = Some(ParentOfChild::Root(self.root));
+            }
+            ChildOfRoot::Comment(n) => {
+                let old_parent = storage.comments.borrow()[n.idx].parent;
+                self.detach_from_old_parent(storage, ChildOfRoot::Comment(n).into(), old_parent);
+                storage.comments.borrow_mut()[n.idx].parent = Some(ParentOfChild::Root(self.root));
+            }
+            ChildOfRoot::ProcessingInstruction(n) => {
+                let old_parent = storage.processing_instructions.borrow()[n.idx].parent;
+                self.detach_from_old_parent(
+                    storage,
+                    ChildOfRoot::ProcessingInstruction(n).into(),
+                    old_parent,
+                );
+                storage.processing_instructions.borrow_mut()[n.idx].parent =
+                    Some(ParentOfChild::Root(self.root));
+            }
         }
     }
 
-    fn of_element(
-        direction: SiblingDirection,
-        element_parent: *mut Element,
+    fn replace_element_child_parent(
+        &self,
+        storage: &Storage,
+        new_parent: Index<Element>,
         child: ChildOfElement,
-    ) -> SiblingIter<'a> {
-        let element_parent_r = unsafe { &*element_parent };
-        let data = &element_parent_r.children;
-        let pos = data.iter().position(|c| *c == child).unwrap();
-
-        let data = match direction {
-            SiblingDirection::Preceding => &data[..pos],
-            SiblingDirection::Following => &data[pos + 1..],
-        };
-
-        SiblingIter {
-            data: SiblingData::FromElement(data.iter()),
+    ) {
+        match child {
+            ChildOfElement::Element(n) => {
+                let old_parent = storage.elements.borrow()[n.idx].parent;
+                self.detach_from_old_parent(storage, child, old_parent);
+                storage.elements.borrow_mut()[n.idx].parent =
+                    Some(ParentOfChild::Element(new_parent));
+            }
+            ChildOfElement::Text(n) => {
+                let old_parent = storage.texts.borrow()[n.idx]
+                    .parent
+                    .map(ParentOfChild::Element);
+                self.detach_from_old_parent(storage, child, old_parent);
+                storage.texts.borrow_mut()[n.idx].parent = Some(new_parent);
+            }
+            ChildOfElement::Comment(n) => {
+                let old_parent = storage.comments.borrow()[n.idx].parent;
+                self.detach_from_old_parent(storage, child, old_parent);
+                storage.comments.borrow_mut()[n.idx].parent =
+                    Some(ParentOfChild::Element(new_parent));
+            }
+            ChildOfElement::ProcessingInstruction(n) => {
+                let old_parent = storage.processing_instructions.borrow()[n.idx].parent;
+                self.detach_from_old_parent(storage, child, old_parent);
+                storage.processing_instructions.borrow_mut()[n.idx].parent =
+                    Some(ParentOfChild::Element(new_parent));
+            }
         }
     }
 
-    fn dead() -> SiblingIter<'a> {
-        SiblingIter {
-            data: SiblingData::Dead,
+    fn detach_from_old_parent(
+        &self,
+        storage: &Storage,
+        child: ChildOfElement,
+        old_parent: Option<ParentOfChild>,
+    ) {
+        match old_parent {
+            Some(ParentOfChild::Root(r)) => {
+                let child_as_root = match child {
+                    ChildOfElement::Element(n) => ChildOfRoot::Element(n),
+                    ChildOfElement::Comment(n) => ChildOfRoot::Comment(n),
+                    ChildOfElement::ProcessingInstruction(n) => {
+                        ChildOfRoot::ProcessingInstruction(n)
+                    }
+                    ChildOfElement::Text(_) => return,
+                };
+                storage.roots.borrow_mut()[r.idx]
+                    .children
+                    .retain(|c| *c != child_as_root);
+            }
+            Some(ParentOfChild::Element(e)) => {
+                storage.elements.borrow_mut()[e.idx]
+                    .children
+                    .retain(|c| *c != child);
+            }
+            None => {}
+        }
+    }
+
+    fn clear_child_parent(&self, storage: &Storage, child: ChildOfElement) {
+        match child {
+            ChildOfElement::Element(n) => {
+                storage.elements.borrow_mut()[n.idx].parent = None;
+            }
+            ChildOfElement::Text(n) => {
+                storage.texts.borrow_mut()[n.idx].parent = None;
+            }
+            ChildOfElement::Comment(n) => {
+                storage.comments.borrow_mut()[n.idx].parent = None;
+            }
+            ChildOfElement::ProcessingInstruction(n) => {
+                storage.processing_instructions.borrow_mut()[n.idx].parent = None;
+            }
         }
     }
 }
 
-impl<'d> Iterator for SiblingIter<'d> {
-    type Item = ChildOfElement;
+// --- NamespacesInScope iterator ---
 
-    fn next(&mut self) -> Option<ChildOfElement> {
-        match self.data {
-            SiblingData::FromRoot(ref mut children) => children.next().map(|&sib| sib.into()),
-            SiblingData::FromElement(ref mut children) => children.next().cloned(),
-            SiblingData::Dead => None,
-        }
+pub struct NamespacesInScope {
+    iter: std::vec::IntoIter<(String, String)>,
+}
+
+impl Iterator for NamespacesInScope {
+    type Item = (String, String);
+
+    fn next(&mut self) -> Option<(String, String)> {
+        self.iter.next()
     }
 }

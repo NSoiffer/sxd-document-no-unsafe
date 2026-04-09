@@ -1,6 +1,7 @@
-use std::{fmt, hash, marker::PhantomData, slice};
+use std::{fmt, hash, marker::PhantomData};
 
 use super::{QName, raw};
+use crate::string_pool::InternedString;
 
 pub struct Storage<'d> {
     storage: &'d raw::Storage,
@@ -77,11 +78,15 @@ impl<'d> Storage<'d> {
 
 pub struct Connections<'d> {
     connections: &'d raw::Connections,
+    storage: &'d raw::Storage,
 }
 
 impl<'d> Connections<'d> {
-    pub fn new(connections: &raw::Connections) -> Connections<'_> {
-        Connections { connections }
+    pub fn new(connections: &'d raw::Connections, storage: &'d raw::Storage) -> Connections<'d> {
+        Connections {
+            connections,
+            storage,
+        }
     }
 
     pub fn root(&self) -> Root<'d> {
@@ -90,17 +95,19 @@ impl<'d> Connections<'d> {
 
     pub fn element_parent(&self, child: Element<'d>) -> Option<ParentOfChild<'d>> {
         self.connections
-            .element_parent(child.node)
+            .element_parent(self.storage, child.node)
             .map(ParentOfChild::wrap)
     }
 
     pub fn text_parent(&self, child: Text<'d>) -> Option<Element<'d>> {
-        self.connections.text_parent(child.node).map(Element::wrap)
+        self.connections
+            .text_parent(self.storage, child.node)
+            .map(Element::wrap)
     }
 
     pub fn comment_parent(&self, child: Comment<'d>) -> Option<ParentOfChild<'d>> {
         self.connections
-            .comment_parent(child.node)
+            .comment_parent(self.storage, child.node)
             .map(ParentOfChild::wrap)
     }
 
@@ -109,7 +116,7 @@ impl<'d> Connections<'d> {
         child: ProcessingInstruction<'d>,
     ) -> Option<ParentOfChild<'d>> {
         self.connections
-            .processing_instruction_parent(child.node)
+            .processing_instruction_parent(self.storage, child.node)
             .map(ParentOfChild::wrap)
     }
 
@@ -118,7 +125,8 @@ impl<'d> Connections<'d> {
         C: Into<ChildOfRoot<'d>>,
     {
         let child = child.into();
-        self.connections.append_root_child(child.as_raw())
+        self.connections
+            .append_root_child(self.storage, child.as_raw())
     }
 
     pub fn append_element_child<C>(&mut self, parent: Element<'d>, child: C)
@@ -127,181 +135,136 @@ impl<'d> Connections<'d> {
     {
         let child = child.into();
         self.connections
-            .append_element_child(parent.node, child.as_raw())
+            .append_element_child(self.storage, parent.node, child.as_raw())
     }
 
-    pub fn root_children(&self) -> RootChildren<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        RootChildren {
-            iter: self.connections.root_children().iter(),
-        }
+    pub fn root_children(&self) -> Vec<ChildOfRoot<'d>> {
+        self.connections
+            .root_children(self.storage)
+            .into_iter()
+            .map(ChildOfRoot::wrap)
+            .collect()
     }
 
-    pub fn element_children(&self, parent: Element<'_>) -> ElementChildren<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        ElementChildren {
-            iter: self.connections.element_children(parent.node).iter(),
-        }
+    pub fn element_children(&self, parent: Element<'_>) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .element_children(self.storage, parent.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
-    pub fn element_preceding_siblings(&self, element: Element<'_>) -> Siblings<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        Siblings {
-            iter: self.connections.element_preceding_siblings(element.node),
-        }
+    pub fn element_preceding_siblings(&self, element: Element<'_>) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .element_preceding_siblings(self.storage, element.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
-    pub fn element_following_siblings(&self, element: Element<'_>) -> Siblings<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        Siblings {
-            iter: self.connections.element_following_siblings(element.node),
-        }
+    pub fn element_following_siblings(&self, element: Element<'_>) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .element_following_siblings(self.storage, element.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
-    pub fn text_preceding_siblings(&self, text: Text<'_>) -> Siblings<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        Siblings {
-            iter: self.connections.text_preceding_siblings(text.node),
-        }
+    pub fn text_preceding_siblings(&self, text: Text<'_>) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .text_preceding_siblings(self.storage, text.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
-    pub fn text_following_siblings(&self, text: Text<'_>) -> Siblings<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        Siblings {
-            iter: self.connections.text_following_siblings(text.node),
-        }
+    pub fn text_following_siblings(&self, text: Text<'_>) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .text_following_siblings(self.storage, text.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
-    pub fn comment_preceding_siblings(&self, comment: Comment<'_>) -> Siblings<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        Siblings {
-            iter: self.connections.comment_preceding_siblings(comment.node),
-        }
+    pub fn comment_preceding_siblings(&self, comment: Comment<'_>) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .comment_preceding_siblings(self.storage, comment.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
-    pub fn comment_following_siblings(&self, comment: Comment<'_>) -> Siblings<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        Siblings {
-            iter: self.connections.comment_following_siblings(comment.node),
-        }
+    pub fn comment_following_siblings(&self, comment: Comment<'_>) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .comment_following_siblings(self.storage, comment.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
     pub fn processing_instruction_preceding_siblings(
         &self,
         pi: ProcessingInstruction<'_>,
-    ) -> Siblings<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        Siblings {
-            iter: self
-                .connections
-                .processing_instruction_preceding_siblings(pi.node),
-        }
+    ) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .processing_instruction_preceding_siblings(self.storage, pi.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
     pub fn processing_instruction_following_siblings(
         &self,
         pi: ProcessingInstruction<'_>,
-    ) -> Siblings<'_> {
-        // This is safe because we disallow mutation while this borrow is active.
-        Siblings {
-            iter: self
-                .connections
-                .processing_instruction_following_siblings(pi.node),
-        }
+    ) -> Vec<ChildOfElement<'d>> {
+        self.connections
+            .processing_instruction_following_siblings(self.storage, pi.node)
+            .into_iter()
+            .map(ChildOfElement::wrap)
+            .collect()
     }
 
     pub fn attribute_parent(&self, attribute: Attribute<'d>) -> Option<Element<'d>> {
         self.connections
-            .attribute_parent(attribute.node)
+            .attribute_parent(self.storage, attribute.node)
             .map(Element::wrap)
     }
 
-    pub fn attributes(&self, parent: Element<'d>) -> Attributes<'d> {
-        // This is safe because we disallow mutation while this borrow is active
-        // TODO: Test that
-        Attributes {
-            iter: self.connections.attributes(parent.node).iter(),
-        }
+    pub fn attributes(&self, parent: Element<'d>) -> Vec<Attribute<'d>> {
+        self.connections
+            .attributes(self.storage, parent.node)
+            .into_iter()
+            .map(Attribute::wrap)
+            .collect()
     }
 
     pub fn set_attribute(&mut self, parent: Element<'d>, attribute: Attribute<'d>) {
-        self.connections.set_attribute(parent.node, attribute.node);
+        self.connections
+            .set_attribute(self.storage, parent.node, attribute.node);
     }
 
-    pub fn attribute_value(&self, parent: Element<'d>, name: &str) -> Option<&'d str> {
-        self.connections.attribute(parent.node, name).map(|a| {
-            let a_r = unsafe { &*a };
-            a_r.value()
-        })
-    }
-}
-
-pub struct RootChildren<'d> {
-    iter: slice::Iter<'d, raw::ChildOfRoot>,
-}
-
-impl<'d> Iterator for RootChildren<'d> {
-    type Item = ChildOfRoot<'d>;
-
-    fn next(&mut self) -> Option<ChildOfRoot<'d>> {
-        self.iter.next().map(|&c| ChildOfRoot::wrap(c))
-    }
-}
-
-pub struct ElementChildren<'d> {
-    iter: slice::Iter<'d, raw::ChildOfElement>,
-}
-
-impl<'d> Iterator for ElementChildren<'d> {
-    type Item = ChildOfElement<'d>;
-
-    fn next(&mut self) -> Option<ChildOfElement<'d>> {
-        self.iter.next().map(|&c| ChildOfElement::wrap(c))
-    }
-}
-
-pub struct Attributes<'d> {
-    iter: slice::Iter<'d, *mut raw::Attribute>,
-}
-
-impl<'d> Iterator for Attributes<'d> {
-    type Item = Attribute<'d>;
-
-    fn next(&mut self) -> Option<Attribute<'d>> {
-        self.iter.next().map(|&a| Attribute::wrap(a))
-    }
-}
-
-pub struct Siblings<'d> {
-    iter: raw::SiblingIter<'d>,
-}
-
-impl<'d> Iterator for Siblings<'d> {
-    type Item = ChildOfElement<'d>;
-
-    fn next(&mut self) -> Option<ChildOfElement<'d>> {
-        self.iter.next().map(ChildOfElement::wrap)
+    pub fn attribute_value(&self, parent: Element<'d>, name: &str) -> Option<InternedString> {
+        self.connections
+            .attribute(self.storage, parent.node, name)
+            .map(|a| self.storage.attribute_value(a))
     }
 }
 
 macro_rules! node(
     ($name:ident, $raw:ty) => (
-        #[derive(Copy,Clone)]
+        #[derive(Copy, Clone)]
         pub struct $name<'d> {
-            node: *mut $raw,
+            node: raw::Index<$raw>,
             lifetime: PhantomData<Storage<'d>>,
         }
 
         impl<'d> $name<'d> {
-            fn wrap(node: *mut $raw) -> $name<'d> {
+            fn wrap(node: raw::Index<$raw>) -> $name<'d> {
                 $name {
                     node,
                     lifetime: PhantomData,
                 }
             }
-
-            #[allow(dead_code)]
-            fn node(&self) -> &'d $raw { unsafe { &*self.node } }
         }
 
         impl<'d> PartialEq for $name<'d> {
@@ -333,86 +296,76 @@ impl<'d> fmt::Debug for Root<'d> {
 node!(Element, raw::Element);
 
 impl<'d> Element<'d> {
-    pub fn name(self) -> QName<'d> {
-        self.node().name()
+    pub fn name(self, storage: &Storage<'_>) -> raw::QNameValue {
+        storage.storage.element_name(self.node)
     }
 }
 
 impl<'d> fmt::Debug for Element<'d> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Element {{ name: {:?} }}", self.name())
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Element {{ idx: {:?} }}", self.node)
     }
 }
 
 node!(Attribute, raw::Attribute);
 
 impl<'d> Attribute<'d> {
-    pub fn name(&self) -> QName<'_> {
-        self.node().name()
+    pub fn name(&self, storage: &Storage<'_>) -> raw::QNameValue {
+        storage.storage.attribute_name(self.node)
     }
-    pub fn value(&self) -> &str {
-        self.node().value()
+    pub fn value(&self, storage: &Storage<'_>) -> InternedString {
+        storage.storage.attribute_value(self.node)
     }
 }
 
 impl<'d> fmt::Debug for Attribute<'d> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Attribute {{ name: {:?}, value: {:?} }}",
-            self.name(),
-            self.value()
-        )
+        write!(f, "Attribute {{ idx: {:?} }}", self.node)
     }
 }
 
 node!(Text, raw::Text);
 
 impl<'d> Text<'d> {
-    pub fn text(&self) -> &str {
-        self.node().text()
+    pub fn text(&self, storage: &Storage<'_>) -> InternedString {
+        storage.storage.text_text(self.node)
     }
 }
 
 impl<'d> fmt::Debug for Text<'d> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Text {{ text: {:?} }}", self.text())
+        write!(f, "Text {{ idx: {:?} }}", self.node)
     }
 }
 
 node!(Comment, raw::Comment);
 
 impl<'d> Comment<'d> {
-    pub fn text(&self) -> &str {
-        self.node().text()
+    pub fn text(&self, storage: &Storage<'_>) -> InternedString {
+        storage.storage.comment_text(self.node)
     }
 }
 
 impl<'d> fmt::Debug for Comment<'d> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Comment {{ text: {:?} }}", self.text())
+        write!(f, "Comment {{ idx: {:?} }}", self.node)
     }
 }
 
 node!(ProcessingInstruction, raw::ProcessingInstruction);
 
 impl<'d> ProcessingInstruction<'d> {
-    pub fn target(self) -> &'d str {
-        self.node().target()
+    pub fn target(self, storage: &Storage<'_>) -> InternedString {
+        storage.storage.pi_target(self.node)
     }
-    pub fn value(self) -> Option<&'d str> {
-        self.node().value()
+    pub fn value(self, storage: &Storage<'_>) -> Option<InternedString> {
+        storage.storage.pi_value(self.node)
     }
 }
 
 impl<'d> fmt::Debug for ProcessingInstruction<'d> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ProcessingInstruction {{ target: {:?}, value: {:?} }}",
-            self.target(),
-            self.value()
-        )
+        write!(f, "ProcessingInstruction {{ idx: {:?} }}", self.node)
     }
 }
 
@@ -572,35 +525,95 @@ mod test {
     };
 
     macro_rules! assert_qname_eq(
-        ($l:expr, $r:expr) => (assert_eq!(Into::<QName<'_>>::into($l), $r.into()));
+        ($l:expr, $r:expr) => (assert_eq!($l.get(), Into::<QName<'_>>::into($r)));
     );
 
     #[test]
     fn root_can_have_element_children() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let element = s.create_element("alpha");
-
         c.append_root_child(element);
-
-        let children: Vec<_> = c.root_children().collect();
+        let children = c.root_children();
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfRoot::Element(element));
+    }
+
+    #[test]
+    fn root_child_knows_its_parent() {
+        let package = Package::new();
+        let (s, mut c) = package.as_thin_document();
+        let alpha = s.create_element("alpha");
+        c.append_root_child(alpha);
+        assert_eq!(Some(ParentOfChild::Root(c.root())), c.element_parent(alpha));
+    }
+
+    #[test]
+    fn elements_can_have_element_children() {
+        let package = Package::new();
+        let (s, mut c) = package.as_thin_document();
+        let alpha = s.create_element("alpha");
+        let beta = s.create_element("beta");
+        c.append_element_child(alpha, beta);
+        let children = c.element_children(alpha);
+        assert_eq!(children[0], ChildOfElement::Element(beta));
+    }
+
+    #[test]
+    fn elements_can_be_renamed() {
+        let package = Package::new();
+        let (s, _c) = package.as_thin_document();
+        let alpha = s.create_element("alpha");
+        s.element_set_name(alpha, "beta");
+        assert_qname_eq!(alpha.name(&s), "beta");
+    }
+
+    #[test]
+    fn elements_have_attributes() {
+        let package = Package::new();
+        let (s, mut c) = package.as_thin_document();
+        let element = s.create_element("element");
+        let attr = s.create_attribute("hello", "world");
+        c.set_attribute(element, attr);
+        assert_eq!(&*c.attribute_value(element, "hello").unwrap(), "world");
+    }
+
+    #[test]
+    fn text_can_be_changed() {
+        let package = Package::new();
+        let (s, _c) = package.as_thin_document();
+        let text = s.create_text("Now is the winter of our discontent.");
+        s.text_set_text(text, "Made glorious summer by this sun of York");
+        assert_eq!(&*text.text(&s), "Made glorious summer by this sun of York");
+    }
+
+    #[test]
+    fn can_return_a_populated_package() {
+        fn populate() -> Package {
+            let package = Package::new();
+            {
+                let (s, mut c) = package.as_thin_document();
+                let element = s.create_element("hello");
+                c.append_root_child(element);
+            }
+            package
+        }
+        let package = populate();
+        let (s, c) = package.as_thin_document();
+        let children = c.root_children();
+        let element = children[0].element().unwrap();
+        assert_qname_eq!(element.name(&s), "hello");
     }
 
     #[test]
     fn root_has_maximum_of_one_element_child() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let alpha = s.create_element("alpha");
         let beta = s.create_element("beta");
-
         c.append_root_child(alpha);
         c.append_root_child(beta);
-
-        let children: Vec<_> = c.root_children().collect();
+        let children = c.root_children();
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfRoot::Element(beta));
     }
@@ -609,12 +622,9 @@ mod test {
     fn root_can_have_comment_children() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let comment = s.create_comment("Now is the winter of our discontent.");
-
         c.append_root_child(comment);
-
-        let children: Vec<_> = c.root_children().collect();
+        let children = c.root_children();
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfRoot::Comment(comment));
     }
@@ -623,57 +633,23 @@ mod test {
     fn root_can_have_processing_instruction_children() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let pi = s.create_processing_instruction("device", None);
-
         c.append_root_child(pi);
-
-        let children: Vec<_> = c.root_children().collect();
+        let children = c.root_children();
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfRoot::ProcessingInstruction(pi));
-    }
-
-    #[test]
-    fn root_child_knows_its_parent() {
-        let package = Package::new();
-        let (s, mut c) = package.as_thin_document();
-
-        let alpha = s.create_element("alpha");
-
-        c.append_root_child(alpha);
-
-        assert_eq!(Some(ParentOfChild::Root(c.root())), c.element_parent(alpha));
-    }
-
-    #[test]
-    fn elements_can_have_element_children() {
-        let package = Package::new();
-        let (s, mut c) = package.as_thin_document();
-
-        let alpha = s.create_element("alpha");
-        let beta = s.create_element("beta");
-
-        c.append_element_child(alpha, beta);
-
-        let children: Vec<_> = c.element_children(alpha).collect();
-
-        assert_eq!(children[0], ChildOfElement::Element(beta));
     }
 
     #[test]
     fn element_children_are_ordered() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let greek = s.create_element("greek");
         let alpha = s.create_element("alpha");
         let omega = s.create_element("omega");
-
         c.append_element_child(greek, alpha);
         c.append_element_child(greek, omega);
-
-        let children: Vec<_> = c.element_children(greek).collect();
-
+        let children = c.element_children(greek);
         assert_eq!(children[0], ChildOfElement::Element(alpha));
         assert_eq!(children[1], ChildOfElement::Element(omega));
     }
@@ -682,12 +658,9 @@ mod test {
     fn element_children_know_their_parent() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let alpha = s.create_element("alpha");
         let beta = s.create_element("beta");
-
         c.append_element_child(alpha, beta);
-
         assert_eq!(Some(ParentOfChild::Element(alpha)), c.element_parent(beta));
     }
 
@@ -695,16 +668,12 @@ mod test {
     fn elements_know_preceding_siblings() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let parent = s.create_element("parent");
         let a = s.create_element("a");
         let b = s.create_element("b");
-
         c.append_element_child(parent, a);
         c.append_element_child(parent, b);
-
-        let preceding: Vec<_> = c.element_preceding_siblings(b).collect();
-
+        let preceding = c.element_preceding_siblings(b);
         assert_eq!(vec![ChildOfElement::Element(a)], preceding);
     }
 
@@ -712,49 +681,22 @@ mod test {
     fn changing_parent_of_element_removes_element_from_original_parent() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let parent1 = s.create_element("parent1");
         let parent2 = s.create_element("parent2");
         let child = s.create_element("child");
-
         c.append_element_child(parent1, child);
         c.append_element_child(parent2, child);
-
-        assert_eq!(0, c.element_children(parent1).count());
-        assert_eq!(1, c.element_children(parent2).count());
-    }
-
-    #[test]
-    fn elements_can_be_renamed() {
-        let package = Package::new();
-        let (s, _) = package.as_thin_document();
-
-        let alpha = s.create_element("alpha");
-        s.element_set_name(alpha, "beta");
-        assert_qname_eq!(alpha.name(), "beta");
-    }
-
-    #[test]
-    fn elements_have_attributes() {
-        let package = Package::new();
-        let (s, mut c) = package.as_thin_document();
-
-        let element = s.create_element("element");
-        let attr = s.create_attribute("hello", "world");
-        c.set_attribute(element, attr);
-
-        assert_eq!(Some("world"), c.attribute_value(element, "hello"));
+        assert_eq!(0, c.element_children(parent1).len());
+        assert_eq!(1, c.element_children(parent2).len());
     }
 
     #[test]
     fn attributes_know_their_element() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let element = s.create_element("element");
         let attr = s.create_attribute("hello", "world");
         c.set_attribute(element, attr);
-
         assert_eq!(Some(element), c.attribute_parent(attr));
     }
 
@@ -762,69 +704,61 @@ mod test {
     fn attributes_belong_to_one_element() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let element1 = s.create_element("element1");
         let element2 = s.create_element("element2");
         let attr = s.create_attribute("hello", "world");
-
         c.set_attribute(element1, attr);
         c.set_attribute(element2, attr);
-
-        assert_eq!(0, c.attributes(element1).count());
-        assert_eq!(1, c.attributes(element2).count());
+        assert_eq!(0, c.attributes(element1).len());
+        assert_eq!(1, c.attributes(element2).len());
     }
 
     #[test]
     fn attributes_can_be_reset() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let element = s.create_element("element");
-
         let attr1 = s.create_attribute("hello", "world");
         let attr2 = s.create_attribute("hello", "galaxy");
-
         c.set_attribute(element, attr1);
         c.set_attribute(element, attr2);
-
-        assert_eq!(Some("galaxy"), c.attribute_value(element, "hello"));
+        assert_eq!(
+            c.attribute_value(element, "hello").as_deref(),
+            Some("galaxy")
+        );
     }
 
     #[test]
     fn attributes_can_be_iterated() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let element = s.create_element("element");
-
         let attr1 = s.create_attribute("name1", "value1");
         let attr2 = s.create_attribute("name2", "value2");
-
         c.set_attribute(element, attr1);
         c.set_attribute(element, attr2);
-
-        let mut attrs: Vec<_> = c.attributes(element).collect();
-        attrs.sort_by(|a, b| a.name().namespace_uri().cmp(&b.name().namespace_uri()));
-
+        let mut attrs = c.attributes(element);
+        attrs.sort_by(|a, b| {
+            a.name(&s)
+                .get()
+                .namespace_uri()
+                .cmp(&b.name(&s).get().namespace_uri())
+        });
         assert_eq!(2, attrs.len());
-        assert_qname_eq!("name1", attrs[0].name());
-        assert_eq!("value1", attrs[0].value());
-        assert_qname_eq!("name2", attrs[1].name());
-        assert_eq!("value2", attrs[1].value());
+        assert_qname_eq!(attrs[0].name(&s), "name1");
+        assert_eq!(&*attrs[0].value(&s), "value1");
+        assert_qname_eq!(attrs[1].name(&s), "name2");
+        assert_eq!(&*attrs[1].value(&s), "value2");
     }
 
     #[test]
     fn elements_can_have_text_children() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let sentence = s.create_element("sentence");
         let text = s.create_text("Now is the winter of our discontent.");
-
         c.append_element_child(sentence, text);
-
-        let children: Vec<_> = c.element_children(sentence).collect();
-
+        let children = c.element_children(sentence);
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfElement::Text(text));
     }
@@ -833,39 +767,20 @@ mod test {
     fn text_knows_its_parent() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let sentence = s.create_element("sentence");
         let text = s.create_text("Now is the winter of our discontent.");
-
         c.append_element_child(sentence, text);
-
         assert_eq!(c.text_parent(text), Some(sentence));
-    }
-
-    #[test]
-    fn text_can_be_changed() {
-        let package = Package::new();
-        let (s, _) = package.as_thin_document();
-
-        let text = s.create_text("Now is the winter of our discontent.");
-
-        s.text_set_text(text, "Made glorious summer by this sun of York");
-
-        assert_eq!(text.text(), "Made glorious summer by this sun of York");
     }
 
     #[test]
     fn elements_can_have_comment_children() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let sentence = s.create_element("sentence");
         let comment = s.create_comment("Now is the winter of our discontent.");
-
         c.append_element_child(sentence, comment);
-
-        let children: Vec<_> = c.element_children(sentence).collect();
-
+        let children = c.element_children(sentence);
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfElement::Comment(comment));
     }
@@ -874,12 +789,9 @@ mod test {
     fn comment_knows_its_parent() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let sentence = s.create_element("sentence");
         let comment = s.create_comment("Now is the winter of our discontent.");
-
         c.append_element_child(sentence, comment);
-
         assert_eq!(
             c.comment_parent(comment),
             Some(ParentOfChild::Element(sentence))
@@ -889,26 +801,23 @@ mod test {
     #[test]
     fn comment_can_be_changed() {
         let package = Package::new();
-        let (s, _) = package.as_thin_document();
-
+        let (s, _c) = package.as_thin_document();
         let comment = s.create_comment("Now is the winter of our discontent.");
-
         s.comment_set_text(comment, "Made glorious summer by this sun of York");
-
-        assert_eq!(comment.text(), "Made glorious summer by this sun of York");
+        assert_eq!(
+            &*comment.text(&s),
+            "Made glorious summer by this sun of York"
+        );
     }
 
     #[test]
     fn elements_can_have_processing_instruction_children() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let element = s.create_element("element");
         let pi = s.create_processing_instruction("device", None);
-
         c.append_element_child(element, pi);
-
-        let children: Vec<_> = c.element_children(element).collect();
+        let children = c.element_children(element);
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfElement::ProcessingInstruction(pi));
     }
@@ -917,12 +826,9 @@ mod test {
     fn processing_instruction_knows_its_parent() {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
-
         let element = s.create_element("element");
         let pi = s.create_processing_instruction("device", None);
-
         c.append_element_child(element, pi);
-
         assert_eq!(
             c.processing_instruction_parent(pi),
             Some(ParentOfChild::Element(element))
@@ -932,35 +838,11 @@ mod test {
     #[test]
     fn processing_instruction_can_be_changed() {
         let package = Package::new();
-        let (s, _) = package.as_thin_document();
-
+        let (s, _c) = package.as_thin_document();
         let pi = s.create_processing_instruction("device", None);
-
         s.processing_instruction_set_target(pi, "output");
         s.processing_instruction_set_value(pi, Some("full-screen"));
-
-        assert_eq!(pi.target(), "output");
-        assert_eq!(pi.value(), Some("full-screen"));
-    }
-
-    #[test]
-    fn can_return_a_populated_package() {
-        fn populate() -> Package {
-            let package = Package::new();
-            {
-                let (s, mut c) = package.as_thin_document();
-
-                let element = s.create_element("hello");
-                c.append_root_child(element);
-            }
-
-            package
-        }
-
-        let package = populate();
-        let (_, c) = package.as_thin_document();
-        let children: Vec<_> = c.root_children().collect();
-        let element = children[0].element().unwrap();
-        assert_qname_eq!(element.name(), "hello");
+        assert_eq!(&*pi.target(&s), "output");
+        assert_eq!(pi.value(&s).as_deref(), Some("full-screen"));
     }
 }

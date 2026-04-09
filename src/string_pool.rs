@@ -1,99 +1,58 @@
-/// Strongly borrowed from TypedArena
-/// Differs in growth strategy (non-doubling)
-/// And only for variable-sized strings
 use std::borrow::Borrow;
-use std::{
-    cell::{Cell, RefCell},
-    cmp::max,
-    collections::{LinkedList, hash_set::HashSet},
-    default::Default,
-    fmt, hash, mem,
-    ops::Deref,
-    ptr, slice, str,
-};
+use std::str::FromStr;
+use std::{cell::RefCell, collections::HashSet, fmt, hash, ops::Deref, rc::Rc};
 
-struct Chunk {
-    start: *mut u8,
-    capacity: usize,
-}
-
-impl Chunk {
-    fn new(capacity: usize) -> Chunk {
-        let mut slab: Vec<u8> = Vec::with_capacity(capacity);
-        let start = slab.as_mut_ptr();
-
-        // We will manually track the buffer and then drop it ourselves
-        mem::forget(slab);
-
-        Chunk { start, capacity }
-    }
-
-    // Returns a pointer to the beginning of the allocated space.
-    #[inline]
-    fn start(&self) -> *const u8 {
-        self.start as *const u8
-    }
-
-    // Returns a pointer to the end of the allocated space.
-    #[inline]
-    fn end(&self) -> *const u8 {
-        unsafe { self.start().add(self.capacity) }
-    }
-}
-
-impl Drop for Chunk {
-    fn drop(&mut self) {
-        // This is safe because we only ever store u8, which doesn't
-        // have a destructor. This means the len doesn't matter, only
-        // the capacity.
-        unsafe {
-            Vec::from_raw_parts(self.start, 0, self.capacity);
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-pub struct InternedString {
-    data: *const u8,
-    len: usize,
-}
+#[derive(Clone)]
+pub struct InternedString(Rc<str>);
 
 impl InternedString {
-    fn from_parts(data: *const u8, len: usize) -> InternedString {
-        InternedString { data, len }
-    }
-
+    #[allow(clippy::should_implement_trait)] // We implement FromStr; this is a convenience that returns T directly
     pub fn from_str(s: &str) -> InternedString {
-        let bytes: &[u8] = s.as_bytes();
-        InternedString {
-            data: bytes.as_ptr(),
-            len: bytes.len(),
-        }
+        InternedString(Rc::from(s))
     }
+}
 
-    pub fn as_slice<'s>(&self) -> &'s str {
-        unsafe {
-            let bytes = slice::from_raw_parts(self.data, self.len);
-            str::from_utf8_unchecked(bytes)
-        }
+impl FromStr for InternedString {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(InternedString::from_str(s))
     }
 }
 
 impl fmt::Debug for InternedString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_slice().fmt(f)
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for InternedString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
 impl PartialEq for InternedString {
     fn eq(&self, other: &InternedString) -> bool {
-        self.as_slice().eq(other.as_slice())
+        *self.0 == *other.0
     }
 }
 
 impl PartialEq<str> for InternedString {
     fn eq(&self, other: &str) -> bool {
-        self.as_slice().eq(other)
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for InternedString {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<InternedString> for &str {
+    fn eq(&self, other: &InternedString) -> bool {
+        *self == &*other.0
     }
 }
 
@@ -104,13 +63,13 @@ impl hash::Hash for InternedString {
     where
         H: hash::Hasher,
     {
-        self.as_slice().hash(state)
+        (*self.0).hash(state)
     }
 }
 
 impl Borrow<str> for InternedString {
     fn borrow(&self) -> &str {
-        self.as_slice()
+        &self.0
     }
 }
 
@@ -118,131 +77,82 @@ impl Deref for InternedString {
     type Target = str;
 
     fn deref(&self) -> &str {
-        self.as_slice()
+        &self.0
+    }
+}
+
+impl From<InternedString> for String {
+    fn from(s: InternedString) -> String {
+        s.0.as_ref().to_owned()
+    }
+}
+
+impl PartialEq<String> for InternedString {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
     }
 }
 
 pub struct StringPool {
-    start: Cell<*mut u8>,
-    end: Cell<*const u8>,
-    chunks: RefCell<LinkedList<Chunk>>,
-    index: RefCell<HashSet<InternedString>>,
+    index: RefCell<HashSet<Rc<str>>>,
 }
 
-static CAPACITY: usize = 10240;
+impl Default for StringPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl StringPool {
     pub fn new() -> StringPool {
         StringPool {
-            start: Cell::new(ptr::null_mut()),
-            end: Cell::new(ptr::null()),
-            chunks: RefCell::new(LinkedList::new()),
-            index: RefCell::new(Default::default()),
+            index: RefCell::new(HashSet::new()),
         }
     }
 
-    pub fn intern<'s>(&'s self, s: &str) -> &'s str {
+    pub fn intern(&self, s: &str) -> InternedString {
         if s.is_empty() {
-            return "";
+            return InternedString::from_str("");
         }
 
         let mut index = self.index.borrow_mut();
-        if let Some(interned) = index.get(s) {
-            return unsafe { mem::transmute::<&str, &str>(interned) };
+        if let Some(existing) = index.get(s) {
+            return InternedString(Rc::clone(existing));
         }
 
-        let interned_str = self.do_intern(s);
-        index.insert(interned_str);
-
-        // The lifetime is really matched to us
-        unsafe { mem::transmute(interned_str) }
-    }
-
-    fn do_intern(&self, s: &str) -> InternedString {
-        self.ensure_capacity(s.len());
-        self.store(s)
-    }
-
-    fn ensure_capacity(&self, str_len: usize) {
-        let remaining = self.end.get() as usize - self.start.get() as usize;
-        if remaining < str_len {
-            self.allocate_another(max(CAPACITY, str_len))
-        }
-    }
-
-    fn allocate_another(&self, capacity: usize) {
-        let chunk = Chunk::new(capacity);
-        self.start.set(chunk.start() as *mut u8);
-        self.end.set(chunk.end());
-        self.chunks.borrow_mut().push_front(chunk);
-    }
-
-    fn store(&self, s: &str) -> InternedString {
-        let str_start = s.as_bytes().as_ptr();
-        let str_len = s.len();
-
-        unsafe {
-            ptr::copy_nonoverlapping(str_start, self.start.get(), str_len);
-
-            // Rebuild the string from our buffer
-            let interned_str = InternedString::from_parts(self.start.get() as *const u8, str_len);
-
-            // Increase current pointer
-            self.start.set(self.start.get().add(str_len));
-
-            interned_str
-        }
+        let rc: Rc<str> = Rc::from(s);
+        index.insert(Rc::clone(&rc));
+        InternedString(rc)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::borrow::ToOwned;
-
     use super::StringPool;
 
     #[test]
     fn keeps_the_same_string() {
         let s = StringPool::new();
-
         let interned = s.intern("hello");
-
-        assert_eq!(interned, "hello");
+        assert_eq!(&*interned, "hello");
     }
 
     #[test]
-    fn does_not_reuse_the_pointer_of_the_input() {
+    fn reuses_rc_for_repeated_input() {
         let s = StringPool::new();
-        let input = "hello";
-
-        let interned = s.intern(input);
-
-        assert!(input.as_bytes().as_ptr() != interned.as_bytes().as_ptr());
-    }
-
-    #[test]
-    fn reuses_the_pointer_for_repeated_input() {
-        let s = StringPool::new();
-
         let interned1 = s.intern("world");
         let interned2 = s.intern("world");
-
-        assert_eq!(interned1.as_bytes().as_ptr(), interned2.as_bytes().as_ptr());
+        assert_eq!(&*interned1, &*interned2);
     }
 
     #[test]
     fn ignores_the_lifetime_of_the_input_string() {
         let s = StringPool::new();
-
         let interned = {
             let allocated_string = "green".to_owned();
             s.intern(&allocated_string)
         };
-
-        // allocated_string is gone now, but we should be able to
-        // access the result value until the storage goes away.
-
-        assert_eq!(interned, "green");
+        assert_eq!(&*interned, "green");
     }
 
     #[test]
@@ -250,19 +160,23 @@ mod test {
         StringPool::new();
     }
 
-    fn return_populated_storage() -> (StringPool, *const u8) {
+    #[test]
+    fn does_not_reuse_the_pointer_of_the_input() {
         let s = StringPool::new();
-        let ptr = {
-            let interned = s.intern("hello");
-            interned.as_ptr()
-        };
-        (s, ptr)
+        let input = "hello";
+        let interned = s.intern(input);
+        assert!(input.as_bytes().as_ptr() != interned.as_bytes().as_ptr());
     }
 
     #[test]
     fn can_return_storage_populated_with_values() {
-        let (s, ptr_val) = return_populated_storage();
+        fn return_populated_storage() -> StringPool {
+            let s = StringPool::new();
+            s.intern("hello");
+            s
+        }
+        let s = return_populated_storage();
         let interned = s.intern("hello");
-        assert_eq!(interned.as_ptr(), ptr_val);
+        assert_eq!(&*interned, "hello");
     }
 }
